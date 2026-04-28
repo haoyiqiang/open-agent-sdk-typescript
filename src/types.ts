@@ -197,6 +197,19 @@ export interface ToolContext {
   model?: string
   /** Parent agent's API type */
   apiType?: import('./providers/types.js').ApiType
+  /**
+   * Read-state cache shared with the parent. Subagents inherit this so a
+   * file the parent has already Read is visible to the subagent without
+   * re-reading. Mirrors CLI `forkSubagent.ts`'s contentReplacement+
+   * fileStateCache propagation.
+   */
+  fileStateCache?: import('./utils/fileCache.js').FileStateCache
+  /**
+   * Content-replacement state shared with the parent. Lets subagents see
+   * substitutions the parent has performed (e.g. redacted secrets) without
+   * re-deriving them.
+   */
+  contentReplacementState?: Map<string, string>
 }
 
 export interface ToolResult {
@@ -220,16 +233,22 @@ export type PermissionMode =
 
 export type PermissionBehavior = 'allow' | 'deny'
 
-export type CanUseToolResult = {
-  behavior: PermissionBehavior
-  updatedInput?: unknown
-  message?: string
-}
+/**
+ * Re-export of the official `PermissionResult` discriminated union. Internal
+ * code should import from here so engine signatures stay aligned with the
+ * public surface (no more bridging layer).
+ */
+export type CanUseToolResult = import('./types/index.js').PermissionResult
 
-export type CanUseToolFn = (
-  tool: ToolDefinition,
-  input: unknown,
-) => Promise<CanUseToolResult>
+/**
+ * Internal alias for the official `CanUseTool` signature. Same shape:
+ *   `(toolName, input, { signal, toolUseID, ... }) => Promise<PermissionResult>`
+ *
+ * The legacy two-arg shape `(tool, input)` is gone. Existing callers that
+ * still want to pass a `ToolDefinition` should look up the name via
+ * `tool.name` at the call site.
+ */
+export type CanUseToolFn = import('./types/index.js').CanUseTool
 
 // --------------------------------------------------------------------------
 // MCP Types
@@ -483,4 +502,14 @@ export interface QueryEngineConfig {
   hookRegistry?: import('./hooks.js').HookRegistry
   /** Session ID for hook context */
   sessionId?: string
+  /** Permission mode echoed in the SDKSystemMessage init event */
+  permissionMode?: PermissionMode
+  /** SDK version reported in the SDKSystemMessage init event */
+  claudeCodeVersion?: string
+  /** Active beta feature flags */
+  betas?: string[]
+  /** File state cache, propagated to ToolContext (subagent inheritance) */
+  fileStateCache?: import('./utils/fileCache.js').FileStateCache
+  /** Content replacement state, propagated to ToolContext */
+  contentReplacementState?: Map<string, string>
 }

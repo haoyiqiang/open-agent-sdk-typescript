@@ -59,6 +59,29 @@ function toProviderTool(tool: ToolDefinition): NormalizedTool {
   }
 }
 
+/**
+ * Map an HTTP status to an `SDKAssistantMessageError` literal expected by
+ * `SDKAPIRetryMessage.error`. Conservative defaults — anything we can't
+ * classify falls back to `'unknown'`.
+ */
+function classifyApiError(
+  status: number | null,
+):
+  | 'authentication_failed'
+  | 'billing_error'
+  | 'rate_limit'
+  | 'invalid_request'
+  | 'server_error'
+  | 'unknown'
+  | 'max_output_tokens' {
+  if (status === 401 || status === 403) return 'authentication_failed'
+  if (status === 402) return 'billing_error'
+  if (status === 429) return 'rate_limit'
+  if (status !== null && status >= 400 && status < 500) return 'invalid_request'
+  if (status !== null && status >= 500) return 'server_error'
+  return 'unknown'
+}
+
 // ============================================================================
 // ToolUseBlock (internal type for extracted tool_use blocks)
 // ============================================================================
@@ -161,23 +184,73 @@ export class QueryEngine {
 
   /**
    * Execute hooks for a lifecycle event.
-   * Returns hook outputs; never throws.
+   * Returns { outputs, events } so callers can yield official-shape
+   * `SDKHookStartedMessage` / `SDKHookResponseMessage` envelopes around the
+   * hook execution. Never throws — hook errors are swallowed and surfaced
+   * via the returned events with `outcome: 'error'`.
    */
-  private async executeHooks(
+  private async executeHooksWithEvents(
     event: import('./hooks.js').HookEvent,
     extra?: Partial<HookInput>,
-  ): Promise<HookOutput[]> {
-    if (!this.hookRegistry?.hasHooks(event)) return []
+  ): Promise<{ outputs: HookOutput[]; events: SDKMessage[] }> {
+    if (!this.hookRegistry?.hasHooks(event)) return { outputs: [], events: [] }
+
+    const events: SDKMessage[] = []
+    const hookId = crypto.randomUUID()
+
+    events.push({
+      type: 'system',
+      subtype: 'hook_started',
+      hook_id: hookId,
+      hook_name: event,
+      hook_event: event,
+      uuid: crypto.randomUUID(),
+      session_id: this.sessionId,
+    } as unknown as SDKMessage)
+
+    let outputs: HookOutput[] = []
+    let outcome: 'success' | 'error' = 'success'
+    let errMsg = ''
     try {
-      return await this.hookRegistry.execute(event, {
+      outputs = await this.hookRegistry.execute(event, {
         event,
         sessionId: this.sessionId,
         cwd: this.config.cwd,
         ...extra,
       })
-    } catch {
-      return []
+    } catch (err) {
+      outcome = 'error'
+      errMsg = err instanceof Error ? err.message : String(err)
     }
+
+    events.push({
+      type: 'system',
+      subtype: 'hook_response',
+      hook_id: hookId,
+      hook_name: event,
+      hook_event: event,
+      output: JSON.stringify(outputs),
+      stdout: '',
+      stderr: errMsg,
+      outcome,
+      uuid: crypto.randomUUID(),
+      session_id: this.sessionId,
+    } as unknown as SDKMessage)
+
+    return { outputs, events }
+  }
+
+  /**
+   * Convenience wrapper for callers that don't want to forward hook events.
+   * Returns just the hook outputs. Used in non-streaming code paths
+   * (e.g. tool dispatch) where the caller can't yield.
+   */
+  private async executeHooks(
+    event: import('./hooks.js').HookEvent,
+    extra?: Partial<HookInput>,
+  ): Promise<HookOutput[]> {
+    const { outputs } = await this.executeHooksWithEvents(event, extra)
+    return outputs
   }
 
   /**
@@ -187,24 +260,28 @@ export class QueryEngine {
   async *submitMessage(
     prompt: string | any[],
   ): AsyncGenerator<SDKMessage> {
-    // Hook: SessionStart
-    await this.executeHooks('SessionStart')
+    const t0 = performance.now()
+
+    // Hook: SessionStart — yield envelopes around the hook so consumers can
+    // observe hook execution as official `SDKHookStarted/Response` events.
+    {
+      const { events } = await this.executeHooksWithEvents('SessionStart')
+      for (const e of events) yield e
+    }
 
     // Hook: UserPromptSubmit
-    const userHookResults = await this.executeHooks('UserPromptSubmit', {
-      toolInput: prompt,
-    })
+    const { outputs: userHookResults, events: userHookEvents } =
+      await this.executeHooksWithEvents('UserPromptSubmit', {
+        toolInput: prompt,
+      })
+    for (const e of userHookEvents) yield e
     // Check if any hook blocks the submission
     if (userHookResults.some((r) => r.block)) {
-      yield {
-        type: 'result',
-        subtype: 'error_during_execution',
-        is_error: true,
-        usage: this.totalUsage,
-        num_turns: 0,
-        cost: 0,
-        errors: ['Blocked by UserPromptSubmit hook'],
-      }
+      yield this.makeResultError(
+        t0,
+        'error_during_execution',
+        ['Blocked by UserPromptSubmit hook'],
+      )
       return
     }
 
@@ -217,17 +294,25 @@ export class QueryEngine {
     // Build system prompt
     const systemPrompt = await buildSystemPrompt(this.config)
 
-    // Emit init system message
+    // Emit init system message — official SDKSystemMessage shape.
     yield {
       type: 'system',
       subtype: 'init',
       session_id: this.sessionId,
-      tools: this.config.tools.map(t => t.name),
-      model: this.config.model,
+      uuid: crypto.randomUUID(),
       cwd: this.config.cwd,
+      tools: this.config.tools.map((t) => t.name),
+      model: this.config.model,
       mcp_servers: [],
-      permission_mode: 'bypassPermissions',
-    } as SDKMessage
+      permissionMode: this.config.permissionMode ?? 'default',
+      slash_commands: [],
+      output_style: 'default',
+      skills: [],
+      plugins: [],
+      apiKeySource: 'user',
+      claude_code_version: this.config.claudeCodeVersion ?? '0.0.0',
+      betas: this.config.betas,
+    } as unknown as SDKMessage
 
     // Agentic loop
     let turnsRemaining = this.config.maxTurns
@@ -244,9 +329,16 @@ export class QueryEngine {
         break
       }
 
-      // Auto-compact if context is too large
+      // Auto-compact if context is too large.
+      // Around it we emit PreCompact / PostCompact hook envelopes and a
+      // `SDKCompactBoundaryMessage` once the compaction actually succeeds.
       if (shouldAutoCompact(this.messages as any[], this.config.model, this.compactState)) {
-        await this.executeHooks('PreCompact')
+        const preTokens = (this.compactState as { lastTokenCount?: number }).lastTokenCount ?? 0
+        const compactT0 = performance.now()
+
+        const pre = await this.executeHooksWithEvents('PreCompact')
+        for (const e of pre.events) yield e
+
         try {
           const result = await compactConversation(
             this.provider,
@@ -256,7 +348,23 @@ export class QueryEngine {
           )
           this.messages = result.compactedMessages as NormalizedMessageParam[]
           this.compactState = result.state
-          await this.executeHooks('PostCompact')
+
+          // Official SDKCompactBoundaryMessage shape
+          yield {
+            type: 'system',
+            subtype: 'compact_boundary',
+            compact_metadata: {
+              trigger: 'auto',
+              pre_tokens: preTokens,
+              post_tokens: (result.state as { lastTokenCount?: number }).lastTokenCount ?? 0,
+              duration_ms: Math.round(performance.now() - compactT0),
+            },
+            uuid: crypto.randomUUID(),
+            session_id: this.sessionId,
+          } as unknown as SDKMessage
+
+          const post = await this.executeHooksWithEvents('PostCompact')
+          for (const e of post.events) yield e
         } catch {
           // Continue with uncompacted messages
         }
@@ -270,9 +378,12 @@ export class QueryEngine {
       this.turnCount++
       turnsRemaining--
 
-      // Make API call with retry via provider
+      // Make API call with retry via provider.
+      // Each retry produces an SDKAPIRetryMessage (yielded once the call
+      // resolves so causality stays intact).
       let response: CreateMessageResponse
       const apiStart = performance.now()
+      const retryEvents: SDKMessage[] = []
       try {
         response = await withRetry(
           async () => {
@@ -294,8 +405,24 @@ export class QueryEngine {
           },
           undefined,
           this.config.abortSignal,
+          (info) => {
+            retryEvents.push({
+              type: 'system',
+              subtype: 'api_retry',
+              attempt: info.attempt,
+              max_retries: info.maxRetries,
+              retry_delay_ms: info.retryDelayMs,
+              error_status: info.errorStatus,
+              error: classifyApiError(info.errorStatus),
+              uuid: crypto.randomUUID(),
+              session_id: this.sessionId,
+            } as unknown as SDKMessage)
+          },
         )
+        for (const e of retryEvents) yield e
       } catch (err: any) {
+        // Surface the retry attempts before the failure result
+        for (const e of retryEvents) yield e
         // Handle prompt-too-long by compacting
         if (isPromptTooLongError(err) && !this.compactState.compacted) {
           try {
@@ -315,13 +442,9 @@ export class QueryEngine {
           }
         }
 
-        yield {
-          type: 'result',
-          subtype: 'error',
-          usage: this.totalUsage,
-          num_turns: this.turnCount,
-          cost: this.totalCost,
-        }
+        yield this.makeResultError(t0, 'error_during_execution', [
+          err instanceof Error ? err.message : String(err),
+        ])
         return
       }
 
@@ -348,14 +471,31 @@ export class QueryEngine {
       // Add assistant message to conversation
       this.messages.push({ role: 'assistant', content: response.content as any })
 
-      // Yield assistant message
+      // Yield assistant message — official SDKAssistantMessage shape.
+      // The `message` field is a BetaMessage-compatible object (id/role/type/
+      // content/model/stop_reason/stop_sequence/usage). We synthesize it from
+      // the provider's normalized response.
       yield {
         type: 'assistant',
+        uuid: crypto.randomUUID(),
+        session_id: this.sessionId,
+        parent_tool_use_id: null,
         message: {
+          id: 'msg_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24),
+          type: 'message',
           role: 'assistant',
+          model: this.config.model,
           content: response.content as any,
+          stop_reason: response.stopReason ?? null,
+          stop_sequence: null,
+          usage: response.usage ?? {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+          },
         },
-      }
+      } as unknown as SDKMessage
 
       // Handle max_output_tokens recovery
       if (
@@ -386,19 +526,28 @@ export class QueryEngine {
       // Execute tools (concurrent read-only, serial mutations)
       const toolResults = await this.executeTools(toolUseBlocks)
 
-      // Yield tool results
-      for (const result of toolResults) {
+      // Yield tool results — official shape: encoded as SDKUserMessage with
+      // a content array of `tool_result` blocks. The official SDK has no
+      // standalone `tool_result` event variant.
+      if (toolResults.length > 0) {
         yield {
-          type: 'tool_result',
-          result: {
-            tool_use_id: result.tool_use_id,
-            tool_name: result.tool_name || '',
-            output:
-              typeof result.content === 'string'
-                ? result.content
-                : JSON.stringify(result.content),
+          type: 'user',
+          uuid: crypto.randomUUID(),
+          session_id: this.sessionId,
+          parent_tool_use_id: null,
+          message: {
+            role: 'user',
+            content: toolResults.map((r) => ({
+              type: 'tool_result' as const,
+              tool_use_id: r.tool_use_id,
+              content:
+                typeof r.content === 'string'
+                  ? r.content
+                  : JSON.stringify(r.content),
+              is_error: r.is_error ?? false,
+            })),
           },
-        }
+        } as unknown as SDKMessage
       }
 
       // Add tool results to conversation
@@ -419,30 +568,121 @@ export class QueryEngine {
     }
 
     // Hook: Stop (end of agentic loop)
-    await this.executeHooks('Stop')
+    {
+      const { events } = await this.executeHooksWithEvents('Stop')
+      for (const e of events) yield e
+    }
 
     // Hook: SessionEnd
-    await this.executeHooks('SessionEnd')
-
-    // Yield enriched final result
-    const endSubtype = budgetExceeded
-      ? 'error_max_budget_usd'
-      : turnsRemaining <= 0
-        ? 'error_max_turns'
-        : 'success'
-
-    yield {
-      type: 'result',
-      subtype: endSubtype,
-      session_id: this.sessionId,
-      is_error: endSubtype !== 'success',
-      num_turns: this.turnCount,
-      total_cost_usd: this.totalCost,
-      duration_api_ms: Math.round(this.apiTimeMs),
-      usage: this.totalUsage,
-      model_usage: { [this.config.model]: { input_tokens: this.totalUsage.input_tokens, output_tokens: this.totalUsage.output_tokens } },
-      cost: this.totalCost,
+    {
+      const { events } = await this.executeHooksWithEvents('SessionEnd')
+      for (const e of events) yield e
     }
+
+    // Yield enriched final result — official SDKResultSuccess / SDKResultError shape.
+    if (budgetExceeded) {
+      yield this.makeResultError(t0, 'error_max_budget_usd', [])
+    } else if (turnsRemaining <= 0) {
+      yield this.makeResultError(t0, 'error_max_turns', [])
+    } else {
+      yield this.makeResultSuccess(t0)
+    }
+  }
+
+  // ----------------------------------------------------------------------
+  // Helpers — build official-shape SDKResult* messages.
+  // ----------------------------------------------------------------------
+
+  private finalText(): string {
+    // Last assistant message's text content, concatenated.
+    for (let i = this.messages.length - 1; i >= 0; i--) {
+      const m = this.messages[i] as { role?: string; content?: unknown }
+      if (m.role !== 'assistant') continue
+      if (Array.isArray(m.content)) {
+        return (m.content as Array<{ type?: string; text?: string }>)
+          .filter((b) => b.type === 'text')
+          .map((b) => b.text ?? '')
+          .join('')
+      }
+      if (typeof m.content === 'string') return m.content
+    }
+    return ''
+  }
+
+  private makeResultSuccess(t0: number): SDKMessage {
+    return {
+      type: 'result',
+      subtype: 'success',
+      duration_ms: Math.round(performance.now() - t0),
+      duration_api_ms: Math.round(this.apiTimeMs),
+      is_error: false,
+      num_turns: this.turnCount,
+      result: this.finalText(),
+      stop_reason: null,
+      total_cost_usd: this.totalCost,
+      usage: {
+        input_tokens: this.totalUsage.input_tokens,
+        output_tokens: this.totalUsage.output_tokens,
+        cache_creation_input_tokens: this.totalUsage.cache_creation_input_tokens ?? 0,
+        cache_read_input_tokens: this.totalUsage.cache_read_input_tokens ?? 0,
+      },
+      modelUsage: {
+        [this.config.model]: {
+          inputTokens: this.totalUsage.input_tokens,
+          outputTokens: this.totalUsage.output_tokens,
+          cacheReadInputTokens: this.totalUsage.cache_read_input_tokens ?? 0,
+          cacheCreationInputTokens: this.totalUsage.cache_creation_input_tokens ?? 0,
+          costUSD: this.totalCost,
+          webSearchRequests: 0,
+          contextWindow: 200_000,
+        },
+      },
+      permission_denials: [],
+      uuid: crypto.randomUUID(),
+      session_id: this.sessionId,
+    } as unknown as SDKMessage
+  }
+
+  private makeResultError(
+    t0: number,
+    subtype:
+      | 'error_during_execution'
+      | 'error_max_turns'
+      | 'error_max_budget_usd'
+      | 'error_max_structured_output_retries',
+    errors: string[],
+  ): SDKMessage {
+    return {
+      type: 'result',
+      subtype,
+      duration_ms: Math.round(performance.now() - t0),
+      duration_api_ms: Math.round(this.apiTimeMs),
+      is_error: true,
+      num_turns: this.turnCount,
+      stop_reason: null,
+      total_cost_usd: this.totalCost,
+      usage: {
+        input_tokens: this.totalUsage.input_tokens,
+        output_tokens: this.totalUsage.output_tokens,
+        cache_creation_input_tokens: this.totalUsage.cache_creation_input_tokens ?? 0,
+        cache_read_input_tokens: this.totalUsage.cache_read_input_tokens ?? 0,
+      },
+      modelUsage: {
+        [this.config.model]: {
+          inputTokens: this.totalUsage.input_tokens,
+          outputTokens: this.totalUsage.output_tokens,
+          cacheReadInputTokens: this.totalUsage.cache_read_input_tokens ?? 0,
+          cacheCreationInputTokens: this.totalUsage.cache_creation_input_tokens ?? 0,
+          costUSD: this.totalCost,
+          webSearchRequests: 0,
+          contextWindow: 200_000,
+        },
+      },
+      permission_denials: [],
+      errors,
+      uuid: crypto.randomUUID(),
+      session_id: this.sessionId,
+    } as unknown as SDKMessage
   }
 
   /**
@@ -460,6 +700,8 @@ export class QueryEngine {
       provider: this.provider,
       model: this.config.model,
       apiType: this.provider.apiType,
+      fileStateCache: this.config.fileStateCache,
+      contentReplacementState: this.config.contentReplacementState,
     }
 
     const MAX_CONCURRENCY = parseInt(
@@ -530,10 +772,18 @@ export class QueryEngine {
       }
     }
 
-    // Check permissions
+    // Check permissions — official CanUseTool signature:
+    //   (toolName, input, { signal, toolUseID, agentID? }) => Promise<PermissionResult>
     if (this.config.canUseTool) {
       try {
-        const permission = await this.config.canUseTool(tool, block.input)
+        const permission = await this.config.canUseTool(
+          block.name,
+          block.input as Record<string, unknown>,
+          {
+            signal: this.config.abortSignal ?? new AbortController().signal,
+            toolUseID: block.id,
+          },
+        )
         if (permission.behavior === 'deny') {
           return {
             type: 'tool_result',

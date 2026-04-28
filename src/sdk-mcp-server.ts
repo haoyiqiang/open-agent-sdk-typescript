@@ -1,78 +1,99 @@
 /**
- * In-Process MCP Server
+ * `createSdkMcpServer()` — official `@anthropic-ai/claude-agent-sdk` shape.
  *
- * createSdkMcpServer() creates an in-process MCP server from tool() definitions.
- * Compatible with open-agent-sdk's createSdkMcpServer().
+ * Returns `McpSdkServerConfigWithInstance` carrying a real
+ * `@modelcontextprotocol/sdk/server/mcp.js` `McpServer` instance, with all
+ * provided `tool()` definitions registered onto it.
  *
- * Usage:
- *   import { tool, createSdkMcpServer } from 'open-agent-sdk'
- *   import { z } from 'zod'
- *
- *   const weatherTool = tool('get_weather', 'Get weather', { city: z.string() },
- *     async ({ city }) => ({ content: [{ type: 'text', text: `22°C in ${city}` }] })
- *   )
- *
- *   const server = createSdkMcpServer({
- *     name: 'weather',
- *     tools: [weatherTool],
- *   })
- *
- *   // Use as MCP server config:
- *   const agent = createAgent({
- *     mcpServers: { weather: server },
- *   })
+ * Tools are namespaced as `mcp__${serverName}__${toolName}` when the engine
+ * pulls them into the in-process tool pool.
  */
 
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import type { SdkMcpToolDefinition } from './tool-helper.js'
-import { sdkToolToToolDefinition } from './tool-helper.js'
-import type { ToolDefinition, McpServerConfig } from './types.js'
+import type { McpSdkServerConfigWithInstance } from './types/index.js'
 
 /**
- * SDK MCP server config that includes the in-process server instance.
+ * Internal sigil used when we attach raw `SdkMcpToolDefinition[]` to the
+ * returned config. The engine's MCP integration reads this to enumerate tools
+ * without having to introspect the McpServer's private state.
  */
-export interface McpSdkServerConfig {
-  type: 'sdk'
-  name: string
-  version: string
-  tools: ToolDefinition[]
-  _sdkTools: SdkMcpToolDefinition<any>[]
+const SDK_TOOLS_SYMBOL: unique symbol = Symbol.for('@codeany/open-agent-sdk:sdk-tools')
+
+/** Internal carrier shape — extends the official type with a private bag. */
+export type McpSdkServerConfigInternal = McpSdkServerConfigWithInstance & {
+  [SDK_TOOLS_SYMBOL]?: SdkMcpToolDefinition<any>[]
 }
 
 /**
- * Create an in-process MCP server from tool definitions.
+ * Create an in-process MCP server from `tool()` definitions.
  *
- * The server runs in the same process as the agent, avoiding
- * subprocess overhead. Tools are directly callable.
+ * The returned object satisfies the official
+ * `McpSdkServerConfigWithInstance` shape exactly:
+ *   `{ type: 'sdk', name: string, instance: McpServer }`
+ *
+ * The agent runtime detects this shape and pulls the registered tools into
+ * its in-process tool pool, so no MCP transport is involved at runtime.
  */
 export function createSdkMcpServer(options: {
   name: string
   version?: string
   tools?: SdkMcpToolDefinition<any>[]
-}): McpSdkServerConfig {
-  const sdkTools = options.tools || []
-
-  // Convert SDK tools to engine-compatible tool definitions
-  // Prefix tool names with mcp__{server_name}__ for namespace isolation
-  const toolDefinitions: ToolDefinition[] = sdkTools.map((sdkTool) => {
-    const toolDef = sdkToolToToolDefinition(sdkTool)
-    return {
-      ...toolDef,
-      name: `mcp__${options.name}__${sdkTool.name}`,
-    }
+  alwaysLoad?: boolean
+}): McpSdkServerConfigWithInstance {
+  const instance = new McpServer({
+    name: options.name,
+    version: options.version ?? '1.0.0',
   })
 
-  return {
+  const tools = options.tools ?? []
+  for (const t of tools) {
+    const _meta = options.alwaysLoad
+      ? { ...(t._meta ?? {}), 'anthropic/alwaysLoad': true }
+      : t._meta
+    // Register with the underlying MCP SDK server so consumers that connect
+    // a transport see the tools listed correctly.
+    instance.registerTool(
+      t.name,
+      {
+        description: t.description,
+        inputSchema: t.inputSchema as never,
+        annotations: t.annotations,
+        _meta,
+      },
+      // Cast: registerTool's typed handler is structurally equivalent to ours
+      // (args, extra) => Promise<CallToolResult>.
+      t.handler as never,
+    )
+  }
+
+  const config: McpSdkServerConfigInternal = {
     type: 'sdk',
     name: options.name,
-    version: options.version || '1.0.0',
-    tools: toolDefinitions,
-    _sdkTools: sdkTools,
+    instance,
+    [SDK_TOOLS_SYMBOL]: tools,
   }
+  return config
 }
 
 /**
- * Check if a server config is an in-process SDK server.
+ * Type-guard for the SDK MCP server config (official shape — has `.instance`).
  */
-export function isSdkServerConfig(config: any): config is McpSdkServerConfig {
-  return config?.type === 'sdk' && Array.isArray(config.tools)
+export function isSdkServerConfig(config: unknown): config is McpSdkServerConfigWithInstance {
+  if (!config || typeof config !== 'object') return false
+  const c = config as { type?: unknown; instance?: unknown }
+  return c.type === 'sdk' && c.instance != null && typeof c.instance === 'object'
+}
+
+/**
+ * Internal: pull the original SdkMcpToolDefinition list off a config returned
+ * by `createSdkMcpServer`. Used by the engine to assemble the tool pool
+ * without going through the McpServer transport layer. Returns an empty array
+ * if the carrier symbol is missing (e.g. config built externally).
+ */
+export function getSdkServerTools(
+  config: McpSdkServerConfigWithInstance,
+): SdkMcpToolDefinition<any>[] {
+  const c = config as McpSdkServerConfigInternal
+  return c[SDK_TOOLS_SYMBOL] ?? []
 }

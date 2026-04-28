@@ -1,10 +1,9 @@
 /**
- * Web Chat Server
+ * Web Chat Server — built on the official `query()` API
  *
- * A lightweight HTTP server providing:
  *   GET  /           — serves the chat UI
  *   POST /api/chat   — SSE stream of agent events
- *   POST /api/new    — resets the session
+ *   POST /api/new    — resets the session (next /api/chat starts a fresh session)
  *
  * Run: npx tsx examples/web/server.ts
  */
@@ -13,26 +12,92 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'http'
 import { readFile } from 'fs/promises'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
-import { createAgent, type Agent } from '../../src/index.js'
+import * as crypto from 'node:crypto'
+import { query, type Query, type SDKUserMessage } from '../../src/index.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const PORT = parseInt(process.env.PORT || '8081')
 
-let agent: Agent | null = null
-
-function getOrCreateAgent(): Agent {
-  if (!agent) {
-    agent = createAgent({
-      model: process.env.CODEANY_MODEL || 'claude-sonnet-4-6',
-      maxTurns: 20,
-    })
-  }
-  return agent
+// One persistent Query for the lifetime of a "session". Inputs are pushed in
+// via streamInput; outputs flow back through the AsyncGenerator.
+type ChatSession = {
+  q: Query
+  pump: { push(text: string): void; close(): void }
 }
 
-function resetAgent(): void {
-  agent?.close().catch(() => {})
-  agent = null
+let session: ChatSession | null = null
+
+function ensureSession(): ChatSession {
+  if (session) return session
+
+  const queue: SDKUserMessage[] = []
+  let resolveNext: ((v: IteratorResult<SDKUserMessage>) => void) | null = null
+  let closed = false
+  const sessionId = crypto.randomUUID()
+
+  const stream: AsyncIterable<SDKUserMessage> = {
+    [Symbol.asyncIterator]() {
+      return {
+        next(): Promise<IteratorResult<SDKUserMessage>> {
+          if (queue.length > 0) {
+            return Promise.resolve({ value: queue.shift()!, done: false })
+          }
+          if (closed) {
+            return Promise.resolve({ value: undefined as unknown as SDKUserMessage, done: true })
+          }
+          return new Promise<IteratorResult<SDKUserMessage>>((res) => {
+            resolveNext = res
+          })
+        },
+      }
+    },
+  }
+
+  const pump = {
+    push(text: string) {
+      const msg: SDKUserMessage = {
+        type: 'user',
+        uuid: crypto.randomUUID() as `${string}-${string}-${string}-${string}-${string}`,
+        session_id: sessionId,
+        parent_tool_use_id: null,
+        message: { role: 'user', content: text },
+      }
+      if (resolveNext) {
+        const r = resolveNext
+        resolveNext = null
+        r({ value: msg, done: false })
+      } else {
+        queue.push(msg)
+      }
+    },
+    close() {
+      closed = true
+      if (resolveNext) {
+        const r = resolveNext
+        resolveNext = null
+        r({ value: undefined as unknown as SDKUserMessage, done: true })
+      }
+    },
+  }
+
+  const q = query({
+    prompt: stream,
+    options: {
+      model: process.env.CODEANY_MODEL || 'claude-sonnet-4-6',
+      maxTurns: 20,
+      sessionId,
+    },
+  })
+
+  session = { q, pump }
+  return session
+}
+
+function resetSession(): void {
+  if (!session) return
+  session.pump.close()
+  session.q.close()
+  session = null
 }
 
 /** Read the full request body as a string. */
@@ -55,11 +120,10 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
     return
   }
 
-  // SSE headers
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
+    Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
   })
 
@@ -67,48 +131,44 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
     res.write(`data: ${JSON.stringify({ event, data })}\n\n`)
   }
 
-  const ag = getOrCreateAgent()
   const startMs = Date.now()
+  const s = ensureSession()
+  s.pump.push(prompt)
 
   try {
-    for await (const ev of ag.query(prompt)) {
-      switch (ev.type) {
-        case 'assistant': {
-          for (const block of ev.message.content) {
-            if (block.type === 'text') {
-              send('text', { text: block.text })
-            } else if (block.type === 'tool_use') {
-              send('tool_use', {
-                id: block.id,
-                name: block.name,
-                input: block.input,
-              })
-            } else if ('thinking' in block) {
-              send('thinking', { thinking: (block as any).thinking })
-            }
-          }
-          break
+    for await (const ev of s.q) {
+      const m = ev as any
+      if (m.type === 'assistant') {
+        for (const block of m.message?.content ?? []) {
+          if (block.type === 'text') send('text', { text: block.text })
+          else if (block.type === 'tool_use')
+            send('tool_use', { id: block.id, name: block.name, input: block.input })
+          else if ('thinking' in block) send('thinking', { thinking: block.thinking })
         }
-        case 'tool_result':
-          send('tool_result', {
-            tool_use_id: ev.result.tool_use_id,
-            content: ev.result.output,
-            is_error: false,
-          })
-          break
-        case 'result':
-          send('result', {
-            num_turns: ev.num_turns ?? 0,
-            input_tokens: ev.usage?.input_tokens ?? 0,
-            output_tokens: ev.usage?.output_tokens ?? 0,
-            cost: ev.total_cost_usd ?? ev.cost ?? 0,
-            duration_ms: Date.now() - startMs,
-          })
-          break
+      } else if (m.type === 'user' && Array.isArray(m.message?.content)) {
+        // Tool results are emitted as SDKUserMessages in the official shape.
+        for (const block of m.message.content) {
+          if (block.type === 'tool_result') {
+            send('tool_result', {
+              tool_use_id: block.tool_use_id,
+              content: block.content,
+              is_error: !!block.is_error,
+            })
+          }
+        }
+      } else if (m.type === 'result') {
+        send('result', {
+          num_turns: m.num_turns ?? 0,
+          input_tokens: m.usage?.input_tokens ?? 0,
+          output_tokens: m.usage?.output_tokens ?? 0,
+          cost: m.total_cost_usd ?? 0,
+          duration_ms: Date.now() - startMs,
+        })
+        break // wait for next /api/chat
       }
     }
-  } catch (err: any) {
-    send('error', { message: err.message })
+  } catch (err) {
+    send('error', { message: err instanceof Error ? err.message : String(err) })
   }
 
   send('done', null)
@@ -117,7 +177,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
 
 /** Handle POST /api/new */
 function handleNewSession(_req: IncomingMessage, res: ServerResponse) {
-  resetAgent()
+  resetSession()
   res.writeHead(200, { 'Content-Type': 'application/json' })
   res.end(JSON.stringify({ ok: true }))
 }
@@ -142,12 +202,12 @@ const server = createServer(async (req, res) => {
 
     res.writeHead(404)
     res.end('Not Found')
-  } catch (err: any) {
+  } catch (err) {
     console.error(err)
     if (!res.headersSent) {
       res.writeHead(500, { 'Content-Type': 'application/json' })
     }
-    res.end(JSON.stringify({ error: err.message }))
+    res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
   }
 })
 

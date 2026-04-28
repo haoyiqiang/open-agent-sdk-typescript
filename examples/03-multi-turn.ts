@@ -1,39 +1,64 @@
 /**
- * Example 3: Multi-Turn Conversation
+ * Example 3: Multi-Turn Conversation — official query() API with streaming input
  *
- * Demonstrates session persistence across multiple turns.
- * The agent remembers context from previous interactions.
+ * Demonstrates session persistence across multiple turns by feeding an
+ * AsyncIterable<SDKUserMessage> stream into a single `query()`.
  *
  * Run: npx tsx examples/03-multi-turn.ts
  */
-import { createAgent } from '../src/index.js'
+import { query, type SDKUserMessage } from '../src/index.js'
+import * as crypto from 'node:crypto'
+
+function userMsg(text: string, sessionId: string): SDKUserMessage {
+  return {
+    type: 'user',
+    uuid: crypto.randomUUID() as `${string}-${string}-${string}-${string}-${string}`,
+    session_id: sessionId,
+    parent_tool_use_id: null,
+    message: { role: 'user', content: text },
+  }
+}
 
 async function main() {
   console.log('--- Example 3: Multi-Turn Conversation ---\n')
 
-  const agent = createAgent({
-    model: process.env.CODEANY_MODEL || 'claude-sonnet-4-6',
-    maxTurns: 5,
-  })
-
-  // Turn 1: Create a file
-  console.log('> Turn 1: Create a file')
-  const r1 = await agent.prompt(
+  const sessionId = crypto.randomUUID()
+  const turns = [
     'Use Bash to run: echo "Hello Open Agent SDK" > /tmp/oas-test.txt. Confirm briefly.',
-  )
-  console.log(`  ${r1.text}\n`)
+    'Read the file you just created and tell me its contents.',
+    'Delete that file with Bash. Confirm.',
+  ]
 
-  // Turn 2: Read back (should remember context)
-  console.log('> Turn 2: Read the file back')
-  const r2 = await agent.prompt('Read the file you just created and tell me its contents.')
-  console.log(`  ${r2.text}\n`)
+  let i = 0
+  async function* prompts(): AsyncGenerator<SDKUserMessage> {
+    for (const t of turns) {
+      console.log(`> Turn ${++i}: ${t.slice(0, 60)}…`)
+      yield userMsg(t, sessionId)
+    }
+  }
 
-  // Turn 3: Clean up
-  console.log('> Turn 3: Cleanup')
-  const r3 = await agent.prompt('Delete that file with Bash. Confirm.')
-  console.log(`  ${r3.text}\n`)
-
-  console.log(`Session history: ${agent.getMessages().length} messages`)
+  let lastText = ''
+  for await (const event of query({
+    prompt: prompts(),
+    options: {
+      model: process.env.CODEANY_MODEL || 'claude-sonnet-4-6',
+      maxTurns: 5,
+      sessionId,
+    },
+  })) {
+    const msg = event as any
+    if (msg.type === 'assistant') {
+      const text = (msg.message?.content || [])
+        .filter((b: any) => b.type === 'text')
+        .map((b: any) => b.text)
+        .join('')
+      if (text) lastText = text
+    }
+    if (msg.type === 'result') {
+      console.log(`  ${lastText}\n`)
+      lastText = ''
+    }
+  }
 }
 
 main().catch(console.error)

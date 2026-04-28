@@ -59,10 +59,25 @@ export function getRetryDelay(attempt: number, config: RetryConfig = DEFAULT_RET
 /**
  * Execute a function with retries.
  */
+/**
+ * Optional retry observer. Invoked after every transient failure, just
+ * before the next attempt's delay starts. Used by the engine to emit
+ * `SDKAPIRetryMessage` events with the exact (attempt, max, delay, error)
+ * tuple the caller is about to wait on.
+ */
+export type RetryObserver = (info: {
+  attempt: number
+  maxRetries: number
+  retryDelayMs: number
+  errorStatus: number | null
+  error: unknown
+}) => void
+
 export async function withRetry<T>(
   fn: () => Promise<T>,
   config: RetryConfig = DEFAULT_RETRY_CONFIG,
   abortSignal?: AbortSignal,
+  observer?: RetryObserver,
 ): Promise<T> {
   let lastError: any
 
@@ -86,6 +101,19 @@ export async function withRetry<T>(
 
       // Wait before retry
       const delay = getRetryDelay(attempt, config)
+      if (observer) {
+        try {
+          observer({
+            attempt: attempt + 1,
+            maxRetries: config.maxRetries,
+            retryDelayMs: delay,
+            errorStatus: typeof err?.status === 'number' ? err.status : null,
+            error: err,
+          })
+        } catch {
+          // observer must never break the retry path
+        }
+      }
       await new Promise((resolve) => setTimeout(resolve, delay))
     }
   }

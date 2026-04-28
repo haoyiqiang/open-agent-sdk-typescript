@@ -30,7 +30,8 @@ import type {
 import { QueryEngine } from './engine.js'
 import { getAllBaseTools, filterTools } from './tools/index.js'
 import { connectMCPServer, type MCPConnection } from './mcp/client.js'
-import { isSdkServerConfig } from './sdk-mcp-server.js'
+import { isSdkServerConfig, getSdkServerTools } from './sdk-mcp-server.js'
+import { sdkToolToToolDefinition } from './tool-helper.js'
 import { registerAgents } from './tools/agent-tool.js'
 import {
   saveSession,
@@ -39,6 +40,7 @@ import {
 import { createHookRegistry, type HookRegistry } from './hooks.js'
 import { initBundledSkills } from './skills/index.js'
 import { createProvider, type LLMProvider, type ApiType } from './providers/index.js'
+import { createFileStateCache } from './utils/fileCache.js'
 import type { NormalizedMessageParam } from './providers/types.js'
 
 // --------------------------------------------------------------------------
@@ -60,6 +62,13 @@ export class Agent {
   private abortCtrl: AbortController | null = null
   private currentEngine: QueryEngine | null = null
   private hookRegistry: HookRegistry
+  /**
+   * Read-state cache shared by every QueryEngine this agent runs and by any
+   * subagent spawned via the Agent tool. Mirrors CLI `forkSubagent.ts`.
+   */
+  private fileStateCache = createFileStateCache()
+  /** Content replacement map shared with subagents. */
+  private contentReplacementState = new Map<string, string>()
 
   constructor(options: AgentOptions = {}) {
     // Shallow copy to avoid mutating caller's object
@@ -198,8 +207,16 @@ export class Agent {
       for (const [name, config] of Object.entries(this.cfg.mcpServers)) {
         try {
           if (isSdkServerConfig(config)) {
-            // In-process SDK MCP server - directly add tools
-            this.toolPool = [...this.toolPool, ...config.tools]
+            // In-process SDK MCP server (official shape: { type, name, instance }).
+            // Pull the registered SdkMcpToolDefinitions off the config and
+            // adapt them to engine ToolDefinitions. Tool names are namespaced
+            // as `mcp__<server>__<tool>` to avoid collisions.
+            const sdkTools = getSdkServerTools(config)
+            const adapted = sdkTools.map((sdkTool) => {
+              const td = sdkToolToToolDefinition(sdkTool)
+              return { ...td, name: `mcp__${name}__${sdkTool.name}` }
+            })
+            this.toolPool = [...this.toolPool, ...adapted]
           } else {
             // External MCP server
             const connection = await connectMCPServer(name, config)
@@ -255,17 +272,22 @@ export class Agent {
       systemPrompt = opts.systemPrompt as string | undefined
     }
 
-    // Build canUseTool based on permission mode
+    // Build canUseTool based on permission mode. Signature matches the
+    // official `CanUseTool`: `(toolName, input, ctxBag) => Promise<PermissionResult>`.
     const permMode = opts.permissionMode ?? 'bypassPermissions'
-    const canUseTool: CanUseToolFn = opts.canUseTool ?? (async (_tool, _input) => {
-      if (permMode === 'bypassPermissions' || permMode === 'dontAsk' || permMode === 'auto') {
+    const canUseTool: CanUseToolFn =
+      opts.canUseTool ??
+      (async (_toolName, _input, _ctx) => {
+        if (
+          permMode === 'bypassPermissions' ||
+          permMode === 'dontAsk' ||
+          permMode === 'auto' ||
+          permMode === 'acceptEdits'
+        ) {
+          return { behavior: 'allow' }
+        }
         return { behavior: 'allow' }
-      }
-      if (permMode === 'acceptEdits') {
-        return { behavior: 'allow' }
-      }
-      return { behavior: 'allow' }
-    })
+      })
 
     // Resolve tools with overrides
     let tools = this.toolPool
@@ -310,6 +332,11 @@ export class Agent {
       agents: opts.agents,
       hookRegistry: this.hookRegistry,
       sessionId: this.sid,
+      permissionMode: opts.permissionMode ?? 'default',
+      claudeCodeVersion: '0.2.0',
+      betas: opts.betas,
+      fileStateCache: this.fileStateCache,
+      contentReplacementState: this.contentReplacementState,
     })
     this.currentEngine = engine
 

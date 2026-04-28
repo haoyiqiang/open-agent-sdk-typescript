@@ -111,7 +111,10 @@ export const AgentTool: ToolDefinition = {
       },
     )
 
-    // Create subagent engine
+    // Create subagent engine. Inherit the parent's read-state cache,
+    // content-replacement map, and abort signal so the subagent shares
+    // observable file state and tears down with the parent. Mirrors CLI
+    // `forkSubagent.ts` semantics.
     const engine = new QueryEngine({
       cwd: context.cwd,
       model: subModel,
@@ -122,6 +125,9 @@ export const AgentTool: ToolDefinition = {
       maxTokens: 16384,
       canUseTool: async () => ({ behavior: 'allow' }),
       includePartialMessages: false,
+      abortSignal: context.abortSignal,
+      fileStateCache: context.fileStateCache,
+      contentReplacementState: context.contentReplacementState,
     })
 
     // Run the subagent

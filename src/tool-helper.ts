@@ -1,124 +1,129 @@
 /**
- * tool() helper - Create tools using Zod schemas
+ * `tool()` helper — official `@anthropic-ai/claude-agent-sdk` shape.
  *
- * Compatible with open-agent-sdk's tool() function.
+ * Defines a tool from a Zod raw shape. Used together with
+ * `createSdkMcpServer()` to register in-process tools an agent can call.
  *
  * Usage:
- *   import { tool } from 'open-agent-sdk'
- *   import { z } from 'zod'
+ * ```ts
+ * import { tool, createSdkMcpServer } from '@codeany/open-agent-sdk'
+ * import { z } from 'zod'
  *
- *   const weatherTool = tool(
- *     'get_weather',
- *     'Get weather for a city',
- *     { city: z.string().describe('City name') },
- *     async ({ city }) => {
- *       return { content: [{ type: 'text', text: `Weather in ${city}: 22°C` }] }
- *     }
- *   )
+ * const weather = tool(
+ *   'get_weather', 'Get weather for a city',
+ *   { city: z.string().describe('City name') },
+ *   async ({ city }) => ({ content: [{ type: 'text', text: `Weather in ${city}: 22°C` }] })
+ * )
+ *
+ * const server = createSdkMcpServer({ name: 'weather', tools: [weather] })
+ * ```
  */
 
 import { z, type ZodRawShape, type ZodObject } from 'zod'
 import { zodToJsonSchema } from 'zod-to-json-schema'
 import type { ToolDefinition, ToolResult, ToolContext } from './types.js'
+import type { CallToolResult, ToolAnnotations } from '@modelcontextprotocol/sdk/types.js'
+
+export type { CallToolResult, ToolAnnotations }
 
 /**
- * Tool annotations (MCP standard).
+ * SDK MCP tool definition. Mirrors the official `SdkMcpToolDefinition` shape
+ * (inputSchema is the raw Zod shape, not a wrapped `ZodObject`).
  */
-export interface ToolAnnotations {
-  readOnlyHint?: boolean
-  destructiveHint?: boolean
-  idempotentHint?: boolean
-  openWorldHint?: boolean
-}
-
-/**
- * Tool call result (MCP-compatible).
- */
-export interface CallToolResult {
-  content: Array<
-    | { type: 'text'; text: string }
-    | { type: 'image'; data: string; mimeType: string }
-    | { type: 'resource'; resource: { uri: string; text?: string; blob?: string } }
-  >
-  isError?: boolean
-}
-
-/**
- * SDK MCP tool definition.
- */
-export interface SdkMcpToolDefinition<T extends ZodRawShape = ZodRawShape> {
+export interface SdkMcpToolDefinition<Schema extends ZodRawShape = ZodRawShape> {
   name: string
   description: string
-  inputSchema: ZodObject<T>
-  handler: (args: z.infer<ZodObject<T>>, extra: unknown) => Promise<CallToolResult>
+  inputSchema: Schema
   annotations?: ToolAnnotations
+  _meta?: Record<string, unknown>
+  handler: (args: z.infer<ZodObject<Schema>>, extra: unknown) => Promise<CallToolResult>
 }
 
 /**
- * Create a tool using Zod schema.
- *
- * Compatible with open-agent-sdk's tool() function.
+ * Define an SDK MCP tool. Mirrors the official `tool()` signature, including
+ * the optional `_meta` and `alwaysLoad` extras.
  */
-export function tool<T extends ZodRawShape>(
+export function tool<Schema extends ZodRawShape>(
   name: string,
   description: string,
-  inputSchema: T,
-  handler: (args: z.infer<ZodObject<T>>, extra: unknown) => Promise<CallToolResult>,
-  extras?: { annotations?: ToolAnnotations },
-): SdkMcpToolDefinition<T> {
+  inputSchema: Schema,
+  handler: (args: z.infer<ZodObject<Schema>>, extra: unknown) => Promise<CallToolResult>,
+  extras?: {
+    annotations?: ToolAnnotations
+    _meta?: Record<string, unknown>
+    alwaysLoad?: boolean
+  },
+): SdkMcpToolDefinition<Schema> {
+  // alwaysLoad is folded into _meta as `anthropic/alwaysLoad`, matching
+  // upstream behaviour in the official package.
+  const _meta: Record<string, unknown> | undefined = extras?.alwaysLoad
+    ? { ...(extras._meta ?? {}), 'anthropic/alwaysLoad': true }
+    : extras?._meta
   return {
     name,
     description,
-    inputSchema: z.object(inputSchema),
-    handler,
+    inputSchema,
     annotations: extras?.annotations,
+    _meta,
+    handler,
   }
 }
 
-/**
- * Convert an SdkMcpToolDefinition to a ToolDefinition for the engine.
- */
+// --------------------------------------------------------------------------
+// Internal: convert an SdkMcpToolDefinition to the engine's ToolDefinition.
+// --------------------------------------------------------------------------
+//
+// The engine consumes JSON-schema based ToolDefinitions. This adapter is used
+// when wiring an SDK MCP server's tools into the in-process tool pool.
+
 export function sdkToolToToolDefinition(sdkTool: SdkMcpToolDefinition<any>): ToolDefinition {
-  const jsonSchema = zodToJsonSchema(sdkTool.inputSchema, { target: 'openApi3' }) as any
+  const wrapped = z.object(sdkTool.inputSchema)
+  const jsonSchema = zodToJsonSchema(wrapped, { target: 'openApi3' }) as {
+    properties?: Record<string, unknown>
+    required?: string[]
+  }
 
   return {
     name: sdkTool.name,
     description: sdkTool.description,
     inputSchema: {
       type: 'object',
-      properties: jsonSchema.properties || {},
-      required: jsonSchema.required || [],
+      properties: jsonSchema.properties ?? {},
+      required: jsonSchema.required ?? [],
     },
     isReadOnly: () => sdkTool.annotations?.readOnlyHint ?? false,
     isConcurrencySafe: () => sdkTool.annotations?.readOnlyHint ?? false,
     isEnabled: () => true,
-    async prompt() { return sdkTool.description },
-    async call(input: any, _context: ToolContext): Promise<ToolResult> {
+    async prompt() {
+      return sdkTool.description
+    },
+    async call(input: unknown, _context: ToolContext): Promise<ToolResult> {
       try {
-        const parsed = sdkTool.inputSchema.parse(input)
+        const parsed = wrapped.parse(input)
         const result = await sdkTool.handler(parsed, {})
-
-        // Convert MCP content blocks to string
         const text = result.content
           .map((block) => {
             if (block.type === 'text') return block.text
             if (block.type === 'image') return `[Image: ${block.mimeType}]`
-            if (block.type === 'resource') return block.resource.text || `[Resource: ${block.resource.uri}]`
+            if (block.type === 'resource') {
+              const r = block.resource as { uri?: string; text?: string }
+              return r.text ?? `[Resource: ${r.uri ?? '?'}]`
+            }
             return JSON.stringify(block)
           })
           .join('\n')
-
         return {
           type: 'tool_result',
           tool_use_id: '',
           content: text,
-          is_error: result.isError || false,
+          is_error: result.isError ?? false,
         }
-      } catch (err: any) {
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
         return {
           type: 'tool_result',
           tool_use_id: '',
-          content: `Error: ${err.message}`,
+          content: `Error: ${msg}`,
           is_error: true,
         }
       }
